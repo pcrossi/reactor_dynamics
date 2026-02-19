@@ -1,371 +1,344 @@
+# -*- coding: utf-8 -*-
 """
 Módulo: reactor_dynamics.py
-Versão: 1.1 (Revisão Didática)
-Autor: Pedro C. R. Rossi / Adaptado para Curso de Eng. Nuclear
-Descrição: Framework para resolução de equações de Cinética Pontual com Acoplamento Multi-Física.
+Versão: 1.0 (Advanced Multi-Physics, Source Aware & Adaptive Control)
+Codificação: UTF-8
+Descrição: Framework profissional para Cinética Pontual de Neutrons com 
+acoplamento multi-física, fonte externa e estratégias de passo adaptativo.
 
-Este módulo permite simular transientes nucleares onde a reatividade e os parâmetros 
-do reator podem variar dinamicamente em função de variáveis de estado (Temperatura, Vazio, Xenônio).
+Este módulo está otimizado para simular transientes onde a "stiffness" (rigidez) 
+das equações de nêutrons prontos exige métodos numéricos robustos (Radau/BDF) 
+ou um controlo heurístico de passo baseado nas constantes de tempo físicas (Tau).
 
 ==============================================================================
-GUIA RÁPIDO DE USO (EXEMPLOS)
+GUIA RÁPIDO DE UTILIZAÇÃO
 ==============================================================================
 
 CASO 1: Inserção de Reatividade em Degrau (Step)
 ------------------------------------------------
-Simula um salto de reatividade (ex: retirada de barra) sem realimentação térmica.
-
-    # 1. Defina os parâmetros nucleares (1 grupo de precursores para simplificar)
-    #    Lambdas [1/s], Betas [-], Tempo de Geração [s]
     physics = ReactorPhysics(lambdas=[0.08], betas=[0.0065], gen_time=1e-5)
-
-    # 2. Defina a função de Reatividade (rho em delta_k/k)
+    
     def rho_step(t, state):
-        # Insere 100 pcm (0.001) após 1 segundo
         return 0.001 if t > 1.0 else 0.0
 
-    # 3. Instancie o Solver e execute
     solver = MultiPhysicsSolver(physics, rho_step)
     sol = solver.solve(t_span=(0, 5), n0=1.0)
-    
-    # Resultado: sol.t (tempo) e sol.y[0] (nêutrons)
 
-
-CASO 2: Transiente com Realimentação Térmica (Feedback)
--------------------------------------------------------
-Simula um pulso de potência limitado pelo Efeito Doppler (aquecimento do combustível).
-Precisamos adicionar uma variável extra ('temp_fuel') ao sistema.
-
-    # 1. Defina a equação diferencial da Temperatura (dT/dt)
-    #    Modelo simples: Calor gerado pela potência - Calor removido
+CASO 2: Realimentação Térmica (Feedback Doppler)
+------------------------------------------------
     def d_temp_fuel(t, state):
-        potencia = state['n']          # Densidade de nêutrons
-        temp = state['temp_fuel']      # Temperatura atual
-        return 50.0 * potencia - 0.5 * (temp - 300.0) 
+        return 50.0 * state['n'] - 0.5 * (state['temp_fuel'] - 300.0) 
 
-    # 2. Defina a Reatividade com Coeficiente de Feedback (Doppler)
     def rho_com_feedback(t, state):
-        alpha_doppler = -1e-5          # -1 pcm/°C
+        alpha_doppler = -1e-5
         delta_T = state['temp_fuel'] - 300.0
-        
-        rho_externo = 0.003 if t > 0.5 else 0.0 # Degrau grande de 300 pcm
-        return rho_externo + (alpha_doppler * delta_T)
+        rho_ext = 0.003 if t > 0.5 else 0.0
+        return rho_ext + (alpha_doppler * delta_T)
 
-    # 3. Configure o Solver com a variável extra
     solver = MultiPhysicsSolver(physics, rho_com_feedback)
-    
-    # Adiciona a variável: nome='temp_fuel', valor_inicial=300.0, derivada=d_temp_fuel
     solver.add_variable('temp_fuel', 300.0, d_temp_fuel)
-    
-    sol = solver.solve((0, 10))
-
+    sol = solver.solve((0, 10), adaptive=True)
 ==============================================================================
 """
 
 import numpy as np
 from scipy.integrate import solve_ivp
+from scipy.interpolate import interp1d
 from typing import Callable, List, Dict, Any, Union, Optional
-
-# ==============================================================================
-# 0. CLASSE AUXILIAR DE RESULTADO
-# ==============================================================================
 
 class SimulationResult:
     """
-    Padroniza a saída da simulação.
-    Garante que o aluno receba o mesmo formato de objeto (sol.t, sol.y),
-    seja usando o solver profissional (Scipy) ou o solver didático (RK4).
+    Padroniza o formato de saída das simulações para garantir uma interface única.
+
+    Atributos:
+        t (np.ndarray): Vetor de tempo de dimensão (M,).
+        y (np.ndarray): Matriz de estados de dimensão (N, M).
+        sol (Callable): Função interpoladora (Cubic Spline, etc.) se dense_output=True.
+        success (bool): Indicador de sucesso da integração.
+        message (str): Mensagem de estado.
     """
-    def __init__(self, t, y):
+    def __init__(self, t: np.ndarray, y: np.ndarray):
         self.t = t
         self.y = y
         self.success = True
         self.message = "Simulação concluída com sucesso."
-
-# ==============================================================================
-# 1. CLASSE DE SUPORTE: VARIÁVEL DE ESTADO
-# ==============================================================================
+        self.sol = None
 
 class StateVariable:
     """
-    Define uma variável física acoplada ao reator (ex: Temperatura, Concentração de Xe-135).
-    Conecta a física nuclear à termohidráulica ou avenenamento.
+    Representa uma variável de estado acoplada à neutrónica (ex: Temperatura, Venenos).
     """
-    
     def __init__(self, name: str, initial_value: float, 
                  derivative_func: Callable[[float, Dict[str, float]], float]):
         """
-        Registra uma nova equação diferencial dy/dt = f(t, state).
-
+        Inicializa uma variável de estado extra.
+        
         Args:
-            name (str): Identificador único (chave usada no dicionário de estado).
-            initial_value (float): Valor inicial em t=0.
-            derivative_func (Callable): Função que calcula a taxa de variação.
+            name: Identificador da variável (ex: 'temp_fuel').
+            initial_value: Valor da condição inicial em t=0.
+            derivative_func: Função que define a derivada dy/dt = f(t, state_dict).
         """
         self.name = name
         self.initial_value = initial_value
         self.derivative_func = derivative_func
 
-
-# ==============================================================================
-# 2. GERENCIADOR DE FÍSICA NUCLEAR (ReactorPhysics)
-# ==============================================================================
-
 class ReactorPhysics:
     """
-    Guardião dos parâmetros nucleares (Cinética Pontual).
-    Permite alterar Beta, Lambda e Tempo de Geração durante a simulação
-    (útil para simular mudanças espectrais ou efeitos de temperatura nos parâmetros).
+    Gestor dos parâmetros cinéticos fundamentais e dos seus modificadores dinâmicos.
     """
-
-    def __init__(self, lambdas, betas, gen_time):
+    def __init__(self, lambdas: List[float], betas: List[float], gen_time: float):
         """
         Args:
-            lambdas (list): Constantes de decaimento dos precursores [s^-1].
-            betas (list): Frações de nêutrons atrasados (efetivos) [-].
-            gen_time (float): Tempo de geração de nêutrons prontos (Lambda) [s].
+            lambdas: Constantes de decaimento dos precursores [s^-1].
+            betas: Frações efetivas de nêutrons atrasados.
+            gen_time: Tempo de geração de nêutrons prontos (Lambda) [s].
         """
         self.lambdas_base = np.array(lambdas)
         self.betas_base = np.array(betas)
         self.gen_time_base = gen_time
         self.num_groups = len(lambdas)
-        self._modifiers = [] # Lista de funções que alteram os parâmetros base
+        self._modifiers = []
 
     def add_modifier(self, target_param: str, func: Callable[[float, Dict[str, float]], float]):
-        """
-        Adiciona uma regra para variação dinâmica de parâmetros.
-        Ex: Alterar o tempo de geração se houver mudança de fase (vazio).
-        """
+        """Regista uma função multiplicadora para alterar dinamicamente um parâmetro nuclear."""
         self._modifiers.append((target_param, func))
 
     def get_parameters(self, t: float, state_dict: Dict[str, float]):
-        """
-        Retorna os parâmetros (Lambda, Beta, GenTime) válidos para o instante atual,
-        aplicando quaisquer modificadores registrados.
-        """
-        L = self.gen_time_base
-        B = self.betas_base.copy()
-        Lam = self.lambdas_base.copy()
-        
+        """Calcula os parâmetros instantâneos aplicando todos os modificadores ativos."""
+        L, B, Lam = self.gen_time_base, self.betas_base.copy(), self.lambdas_base.copy()
         for target, func in self._modifiers:
             factor = func(t, state_dict)
             if target == 'gen_time': L *= factor
             elif target == 'betas':  B *= factor
             elif target == 'lambdas': Lam *= factor
-            
         return Lam, B, L
-
-
-# ==============================================================================
-# 3. MOTOR DE SOLUÇÃO (MultiPhysicsSolver)
-# ==============================================================================
 
 class MultiPhysicsSolver:
     """
-    Núcleo da simulação. Integra o sistema acoplado:
-    [Neutrônica (Rígida)] <---> [Termohidráulica/Outros (Lenta/Rápida)]
+    Integrador numérico para a Cinética Pontual com Acoplamentos Multi-Física e Fonte Externa.
     """
-
-    def __init__(self, physics: ReactorPhysics, rho_func: Callable[[float, Dict], float]):
+    def __init__(self, physics: ReactorPhysics, 
+                 rho_func: Callable[[float, Dict], float],
+                 source_func: Optional[Callable[[float, Dict], float]] = None):
         """
+        Inicializa o solver definindo a física do núcleo, a reatividade e a fonte externa.
+
         Args:
-            physics: Objeto ReactorPhysics configurado.
-            rho_func: Função que retorna a Reatividade Total (externa + feedback) [delta_k/k].
-                      Assinatura: def rho(t, state_dict) -> float
+            physics: Instância de ReactorPhysics contendo lambdas, betas e Lambda.
+            rho_func: Função rho(t, state) que retorna a reatividade absoluta [delta_k/k].
+            source_func: (Opcional) Função S(t, state) que retorna a taxa da fonte [nêutrons/s].
+                         Se não for fornecida (None), assume-se S(t) = 0 (reator sem fonte).
         """
         self.physics = physics
-        self.rho_func = rho_func 
+        self.rho_func = rho_func
+        # Função anónima nula para assegurar retrocompatibilidade se não houver fonte
+        self.source_func = source_func if source_func else lambda t, s: 0.0
         self.extra_vars: List[StateVariable] = []
-        
-    def add_variable(self, name, initial, derivative_func):
-        """
-        Adiciona uma equação de balanço extra (energia, massa, veneno).
-        """
+
+    def add_variable(self, name: str, initial: float, derivative_func: Callable):
+        """Adiciona uma Equação Diferencial Ordinária (EDO) extra ao sistema global."""
         self.extra_vars.append(StateVariable(name, initial, derivative_func))
 
-    # --- Helpers de Vetorização (Internos) ---
-    # O solver numérico "enxerga" apenas um vetor longo de números (y).
-    # Estes métodos convertem y <-> Dicionário legível (state_dict).
-
-    def _pack_state(self, N, C, extras):
-        """Junta Nêutrons, Precursores e Extras em um vetor único."""
-        return np.concatenate(([N], C, extras))
-
-    def _unpack_state(self, y):
-        """Separa o vetor único em componentes físicas e cria o dicionário de estado."""
-        N = y[0] # Nêutrons (sempre o índice 0)
-        C = y[1 : 1 + self.physics.num_groups] # Precursores
-        extras_vals = y[1 + self.physics.num_groups :] # Variáveis extras
-        
-        # Cria dicionário para facilitar o acesso nas funções do usuário (ex: state['temp'])
+    def _unpack_state(self, y: np.ndarray):
+        """Traduz o vetor numérico contínuo 'y' para um dicionário legível de componentes físicas."""
+        N = y[0]
+        C = y[1 : 1 + self.physics.num_groups]
+        extras_vals = y[1 + self.physics.num_groups :]
         state_dict = {'n': N}
         for i, var in enumerate(self.extra_vars):
             state_dict[var.name] = extras_vals[i]
-            
         return N, C, extras_vals, state_dict
 
-    def _get_initial_state_vector(self, n0):
-        """Calcula o vetor inicial (t=0) assumindo equilíbrio dos precursores."""
+    def _get_initial_state_vector(self, n0: float) -> np.ndarray:
+        """Calcula o vetor de estado inicial assumindo o equilíbrio analítico dos precursores."""
         lam, betas, L = self.physics.get_parameters(0, {'n': n0}) 
-        
         y0_neutronics = np.zeros(self.physics.num_groups + 1)
         y0_neutronics[0] = n0
-        # Condição de equilíbrio: dC/dt = 0 => C_i = (beta_i * n) / (Lambda * lambda_i)
+        # Equilíbrio dos precursores: dC/dt = 0 => lambda*C = (beta/L)*n
         y0_neutronics[1:] = (betas * n0) / (L * lam)
-        
         y0_extras = [v.initial_value for v in self.extra_vars]
         return np.concatenate((y0_neutronics, y0_extras))
 
-    def _rhs(self, t, y):
-        """
-        Right-Hand Side (O coração do sistema).
-        Calcula as derivadas dy/dt para o instante t.
-        """
-        # 1. Desempacota o estado atual
+    def _rhs(self, t: float, y: np.ndarray) -> np.ndarray:
+        """Define o sistema de EDOs (Right-Hand Side), incluindo o termo de Fonte Externa."""
         N, C, _, state_dict = self._unpack_state(y)
-        
-        # 2. Atualiza parâmetros físicos (caso variem com o tempo/estado)
         lam, betas, L = self.physics.get_parameters(t, state_dict)
         beta_t = np.sum(betas)
-        
-        # 3. Calcula a Reatividade Total (incluindo feedback se houver)
         rho = self.rho_func(t, state_dict)
         
-        # 4. Equações de Cinética Pontual (Neutrônica)
-        # dN/dt = ((rho - beta)/L)*N + sum(lambda * C)
-        dn = ((rho - beta_t) / L) * N + np.sum(lam * C)
-        # dC/dt = (beta/L)*N - lambda * C
+        # Calcula o valor instantâneo da Fonte Externa S(t)
+        source = self.source_func(t, state_dict)
+        
+        # Equação da Cinética Pontual com Fonte:
+        # dn/dt = ((rho - beta)/Lambda) * n + Soma(lambda * C) + S
+        dn = ((rho - beta_t) / L) * N + np.sum(lam * C) + source
+        
+        # Equação dos Precursores de nêutrons Atrasados
         dc = (betas / L) * N - lam * C
         
-        # 5. Equações das Variáveis Extras (Termohidráulica, etc.)
-        d_extras = []
-        for var in self.extra_vars:
-            d_extras.append(var.derivative_func(t, state_dict))
-            
+        # Avaliação das EDOs acopladas (Temperatura, Venenos, etc.)
+        d_extras = [var.derivative_func(t, state_dict) for var in self.extra_vars]
         return np.concatenate(([dn], dc, d_extras))
+
+    def solve(self, t_span: tuple, n0: Optional[float] = 1.0, driver: Union[str, Callable] = 'scipy', 
+              adaptive: bool = False, **kwargs):
+        """
+        Executa a integração numérica do sistema acoplado.
+
+        Args:
+            t_span: Tuplo contendo os instantes (t_inicial, t_final).
+            n0: Potência inicial (N). Se None, o solver calcula automaticamente o equilíbrio 
+                subcrítico com base na fonte S(0) e na reatividade rho(0).
+            driver: Motor de integração: 'scipy' (recomendado) ou 'rk4' (didático).
+            adaptive: Se True, ativa a heurística manual baseada no parâmetro físico Tau.
+                      Se False, delega o controlo adaptativo aos métodos nativos do SciPy (Radau/BDF).
+            **kwargs: Opções avançadas de controlo numérico:
+                - method (str): Método SciPy ('Radau', 'BDF', 'RK45'). Padrão: 'Radau'.
+                - rtol, atol (float): Tolerâncias de erro relativo e absoluto.
+                - dense_output (bool): Retorna uma função interpoladora contínua em res.sol.
+                - interp_kind (str): Método de interpolação se dense_output=True 
+                                     ('linear', 'cubic', 'nearest'). Padrão: 'linear' 
+                                     (evita overshoot artificial em descontinuidades bruscas).
+                - max_step (float): Limite superior do passo no modo adaptativo manual.
+                - safety_factor (float): Fracção de Tau utilizada para definir o passo (padrão: 0.1).
+                - first_step (float): Dimensão do passo inicial para arrancar o modo adaptativo.
+        """
+        # --- Tratamento Automático do Estado Inicial (Cálculo de Equilíbrio Subcrítico) ---
+        if n0 is None:
+            # Cria um estado provisório para extrair as avaliações paramétricas em t=0
+            t0 = t_span[0]
+            dummy_state = {'n': 0.0} 
+            for var in self.extra_vars: 
+                dummy_state[var.name] = var.initial_value
+
+            rho_0 = self.rho_func(t0, dummy_state)
+            src_0 = self.source_func(t0, dummy_state)
+            _, _, L = self.physics.get_parameters(t0, dummy_state)
+
+            # Validações de viabilidade física para sistemas estacionários
+            if abs(rho_0) < 1e-9 and src_0 > 1e-9:
+                 raise ValueError("Configuração Inválida: Reator Crítico (rho=0) com Fonte não possui equilíbrio estacionário (dn/dt > 0).")
+            if rho_0 > 0:
+                 raise ValueError("Configuração Inválida: Reator Supercrítico (rho>0) não possui equilíbrio estacionário.")
+            
+            # Aplicação da Fórmula da Multiplicação Subcrítica: n = - (Lambda * S) / rho
+            if abs(rho_0) > 1e-9:
+                n0 = - (L * src_0) / rho_0
+                print(f"--> [AUTO] Inicialização: n0 calculado como {n0:.4e} (Equilíbrio com Fonte).")
+            else:
+                n0 = 0.0 # Sem fonte e sem reatividade, o reator está vazio.
+        
+        # Gera o vetor de estado inicial completo
+        y0 = self._get_initial_state_vector(n0)
+        want_dense = kwargs.get('dense_output', False)
+
+        # --- OPÇÃO 1: INTEGRADOR NATIVO SCIPY (Recomendado para simulações longas e rígidas) ---
+        if driver == 'scipy' and not adaptive:
+            if 'method' not in kwargs: kwargs['method'] = 'Radau'
+            if 'rtol' not in kwargs: kwargs['rtol'] = 1e-8
+            if 'atol' not in kwargs: kwargs['atol'] = 1e-10
+            
+            return solve_ivp(self._rhs, t_span, y0, **kwargs)
+
+        # --- OPÇÃO 2: ALGORITMO ADAPTATIVO MANUAL (Controlo fino e análise didática) ---
+        if driver == 'scipy' and adaptive:
+            t_start, t_final = t_span
+            method = kwargs.get('method', 'Radau')
+            safety_factor = kwargs.get('safety_factor', 0.1) 
+            
+            # Limite superior de passo (max_step) para prevenir "saltos" cegos no regime permanente
+            default_max = max(1.0, (t_final - t_start) / 100.0)
+            max_step_user = kwargs.get('max_step', default_max)
+            
+            t_all, y_all = [t_start], [y0]
+            current_t, current_y = t_start, y0
+            current_dt = kwargs.get('first_step', 1e-6)
+
+            while current_t < t_final:
+                # Ajuste de fronteira para impedir que o solver ultrapasse t_final
+                if current_t + current_dt > t_final:
+                    current_dt = t_final - current_t
+                
+                sol_step = solve_ivp(self._rhs, (current_t, current_t + current_dt), 
+                                     current_y, method=method, 
+                                     rtol=kwargs.get('rtol', 1e-8), 
+                                     atol=kwargs.get('atol', 1e-10))
+                
+                # Redução drástica de passo caso o integrador de baixo nível divirja
+                if not sol_step.success:
+                    current_dt *= 0.5
+                    if current_dt < 1e-15: 
+                        break
+                    continue
+                
+                y_next = sol_step.y[:, -1]
+                t_next = sol_step.t[-1]
+                
+                # Cálculo da Heurística Física Baseada no Tempo Característico (Tau)
+                derivs = self._rhs(t_next, y_next)
+                scale_times = []
+                for i, val in enumerate(y_next):
+                    rate = abs(derivs[i])
+                    val_abs = abs(val)
+                    if val_abs > 1e-12 and rate > 1e-20:
+                        scale_times.append(val_abs / rate)
+                
+                # Aceleração em Regime Permanente (Steady State) vs Transiente Rápido
+                if not scale_times:
+                    suggested_dt = current_dt * 2.0
+                else:
+                    min_tau = min(scale_times)
+                    suggested_dt = safety_factor * min_tau
+                
+                # Suavização do passo (evita instabilidade no controlo do dt)
+                next_dt = np.clip(suggested_dt, current_dt * 0.1, current_dt * 2.0)
+                current_dt = min(next_dt, max_step_user)
+                
+                current_t = t_next
+                current_y = y_next
+                t_all.append(current_t)
+                y_all.append(current_y)
+
+            # Empacotamento do resultado com interpolação customizável
+            res = SimulationResult(np.array(t_all), np.array(y_all).T)
+          
+            if want_dense:
+                # O padrão 'linear' garante estabilidade morfológica sem overshoot em degraus
+                interp_method = kwargs.get('interp_kind', 'linear')
+                
+                res.sol = interp1d(
+                    res.t, res.y, 
+                    kind=interp_method, 
+                    axis=1, 
+                    fill_value="extrapolate"
+                )
+            return res
+
+        # --- DRIVERS LEGADOS E CUSTOMIZADOS ---
+        elif driver == 'rk4':
+            return self._solve_rk4(t_span, y0, kwargs.get('dt', 0.001))
+        elif callable(driver):
+            return driver(self._rhs, t_span, y0, **kwargs)
+        else:
+            raise ValueError(f"Driver '{driver}' não reconhecido.")
 
     def _solve_rk4(self, t_span, y0, dt):
         """
-        Método Didático: Runge-Kutta de 4ª Ordem com passo fixo.
-        Ideal para ensino, pois permite ver o algoritmo 'abrindo a caixa preta'.
+        Método de Runge-Kutta de 4ª ordem clássico (Passo Fixo).
+        Incluído exclusivamente para fins comparativos ou didáticos, uma vez que 
+        este método explícito é vulnerável à rigidez da cinética de nêutrons.
         """
         t_start, t_end = t_span
         times = np.arange(t_start, t_end + dt, dt)
-        states = [y0]
-        
+        y_all = [y0]
         y_curr = y0
+        
         for t in times[:-1]:
-            # Passo padrão RK4
             k1 = self._rhs(t, y_curr)
             k2 = self._rhs(t + dt/2, y_curr + dt/2 * k1)
             k3 = self._rhs(t + dt/2, y_curr + dt/2 * k2)
             k4 = self._rhs(t + dt, y_curr + dt * k3)
+            y_curr = y_curr + (dt/6) * (k1 + 2*k2 + 2*k3 + k4)
+            y_all.append(y_curr)
             
-            y_next = y_curr + (dt/6) * (k1 + 2*k2 + 2*k3 + k4)
-            states.append(y_next)
-            y_curr = y_next
-            
-        min_len = min(len(times), len(states))
-        return SimulationResult(np.array(times[:min_len]), np.array(states[:min_len]).T)
-    
-    def solve(self, t_span, n0=1.0, driver: Union[str, Callable] = 'scipy', adaptive: bool = False, **kwargs):
-            """
-            Executa a simulação.
-    
-            Args:
-                t_span (tuple): (inicio, fim), ex: (0.0, 10.0).
-                n0 (float): Potência inicial (normalizada).
-                driver (str): 'scipy' (recomendado) ou 'rk4' (didático).
-                adaptive (bool): Se True, usa lógica manual de controle de passo físico
-                                 (útil para transientes extremamente rápidos/rígidos).
-                **kwargs: Opções extras (method, rtol, dt, etc).
-            """
-            y0 = self._get_initial_state_vector(n0)
-            adaptive_flag = kwargs.pop('adaptive', False) or adaptive
-            
-            # --- DRIVER 1: SCIPY (Profissional) ---
-            if driver == 'scipy':
-                # Padrões robustos para equações rígidas (Stiff)
-                if 'method' not in kwargs: kwargs['method'] = 'Radau'
-                if 'rtol' not in kwargs: kwargs['rtol'] = 1e-8
-                if 'atol' not in kwargs: kwargs['atol'] = 1e-10
-                
-                # Modo Adaptativo Físico (Manual)
-                # Tenta controlar o passo observando a constante de tempo mais rápida do sistema
-                if adaptive_flag:
-                    t_start, t_final = t_span
-                    method = kwargs.get('method', 'Radau')
-                    rtol = kwargs.get('rtol', 1e-8)
-                    atol = kwargs.get('atol', 1e-10)
-                    
-                    safety_factor = 0.05  # Limite: passo <= 5% da menor constante de tempo
-                    min_step = 1e-14
-                    max_step_user = kwargs.get('max_step', np.inf)
-                    
-                    t_all = [t_start]
-                    y_all = [y0]
-                    current_t = t_start
-                    current_y = y0
-                    current_dt = kwargs.get('first_step', 1e-6)
-    
-                    # Loop manual de integração
-                    while current_t < t_final:
-                        if current_t + current_dt > t_final:
-                            current_dt = t_final - current_t
-                        
-                        sol_step = solve_ivp(
-                            self._rhs, 
-                            (current_t, current_t + current_dt), 
-                            current_y,
-                            method=method, rtol=rtol, atol=atol
-                        )
-                        
-                        if not sol_step.success:
-                            current_dt *= 0.5 
-                            if current_dt < min_step: break
-                            continue
-                        
-                        y_next = sol_step.y[:, -1]
-                        t_next = sol_step.t[-1]
-                        
-                        # Análise Física para o próximo passo:
-                        # Estima as derivadas e encontra a variável que está mudando mais rápido
-                        derivs = self._rhs(t_next, y_next)
-                        scale_times = []
-                        for i, val in enumerate(y_next):
-                            rate = abs(derivs[i])
-                            val_abs = abs(val)
-                            if val_abs > 1e-12 and rate > 1e-20:
-                                scale_times.append(val_abs / rate) # Tau = valor / taxa
-                        
-                        if scale_times:
-                            min_tau = min(scale_times)
-                            suggested_dt = safety_factor * min_tau
-                            # Evita oscilação brusca de dt
-                            suggested_dt = np.clip(suggested_dt, current_dt * 0.1, current_dt * 2.0)
-                        else:
-                            suggested_dt = current_dt * 2.0
-    
-                        current_dt = np.clip(suggested_dt, min_step, max_step_user)
-                        
-                        t_all.append(t_next)
-                        y_all.append(y_next)
-                        current_t = t_next
-                        current_y = y_next
-                    
-                    return SimulationResult(np.array(t_all), np.array(y_all).T)
-    
-                # Modo Padrão Scipy (Automático)
-                else:
-                    return solve_ivp(self._rhs, t_span, y0, **kwargs)
-            
-            # --- DRIVER 2: RK4 (Didático) ---
-            elif driver == 'rk4':
-                dt = kwargs.get('dt', 0.001)
-                return self._solve_rk4(t_span, y0, dt)
-                
-            elif callable(driver):
-                return driver(self._rhs, t_span, y0, **kwargs)
-                
-            else:
-                raise ValueError(f"Driver '{driver}' não reconhecido.")
+        return SimulationResult(times, np.array(y_all).T)
